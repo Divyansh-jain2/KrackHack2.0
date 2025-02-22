@@ -1,0 +1,7 @@
+flask
+python-magic
+yara-python
+pefile
+flask-cors
+python-docx
+PyPDF2
