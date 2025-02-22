@@ -1,35 +1,22 @@
 from flask import Flask, request, jsonify
 from werkzeug.utils import secure_filename
-import os
-import yara
-import magic
-import pefile
+from utils.yara_manager import YaraManager
+from utils.file_analysis import (
+    PEAnalyzer,
+    PDFAnalyzer,
+    DOCXAnalyzer
+)
+from utils.security import validate_file, calculate_entropy
 import tempfile
-from utils.file_analysis import analyze_file
-from utils.security import validate_file
-from flask_cors import CORS
+import os
 
 app = Flask(__name__)
-CORS(app, resources={
-    r"/upload": {
-        "origins": "http://localhost:5173",
-        "methods": ["POST"],
-        "allow_headers": ["Content-Type"]
-    }
-})
-
-# Configuration
-app.config['MAX_CONTENT_LENGTH'] = 16 * 1024 * 1024  # 16MB limit
-app.config['UPLOAD_FOLDER'] = tempfile.gettempdir()
-app.config['YARA_RULES'] = os.path.join(os.path.dirname(__file__), 'yara_rules/malware_rules.yar')
-
-# Load YARA rules
-rules = yara.compile(app.config['YARA_RULES'])
-
-@app.route('/')
-def health_check():
-    return jsonify({"status": "Malware Scanner API", "version": "1.0.0"}), 200
-
+yara = YaraManager()
+analyzers = {
+    'application/x-msdownload': PEAnalyzer(),
+    'application/pdf': PDFAnalyzer(),
+    'application/vnd.openxmlformats-officedocument.wordprocessingml.document': DOCXAnalyzer()
+}
 
 @app.route('/upload', methods=['POST'])
 def upload_file():
@@ -40,29 +27,56 @@ def upload_file():
     if not file or file.filename == '':
         return jsonify({'error': 'Invalid file'}), 400
 
-    # Security checks
     try:
-        filename = secure_filename(file.filename)
-        file_path = os.path.join(app.config['UPLOAD_FOLDER'], filename)
-        file.save(file_path)
-        
-        if not validate_file(file_path):
-            return jsonify({'error': 'File validation failed'}), 400
+        with tempfile.NamedTemporaryFile(delete=False) as tmp_file:
+            file.save(tmp_file.name)
+            valid, message = validate_file(tmp_file.name)
+            if not valid:
+                return jsonify({'error': message}), 400
+
+            # Perform analysis
+            result = {
+                'verdict': 'Clean',
+                'score': 0,
+                'findings': [],
+                'metadata': {
+                    'file_type': magic.from_file(tmp_file.name, mime=True),
+                    'sha256': hashlib.sha256(file.read()).hexdigest()
+                }
+            }
             
-    except Exception as e:
-        return jsonify({'error': str(e)}), 500
+            # YARA Analysis
+            yara_matches = yara.scan_file(tmp_file.name)
+            if yara_matches:
+                result['score'] += len(yara_matches) * 20
+                result['findings'].extend([
+                    f"YARA: {m.rule} (tags: {', '.join(m.tags)})" 
+                    for m in yara_matches
+                ])
+            
+            # File-Type Specific Analysis
+            analyzer = analyzers.get(result['metadata']['file_type'])
+            if analyzer:
+                analysis_result = analyzer.analyze(tmp_file.name)
+                result['score'] += analysis_result['score']
+                result['findings'].extend(analysis_result['findings'])
+            
+            # Entropy Check
+            entropy = calculate_entropy(tmp_file.name)
+            if entropy > 7.5:
+                result['score'] += 25
+                result['findings'].append(f"High entropy detected: {entropy:.2f}")
+            
+            # Determine Verdict
+            if result['score'] >= 75:
+                result['verdict'] = 'Malicious'
+            elif result['score'] >= 40:
+                result['verdict'] = 'Suspicious'
+            
+            return jsonify(result)
 
-    # Analyze the file
-    try:
-        analysis_result = analyze_file(file_path, rules)
-        return jsonify(analysis_result)
-        
     except Exception as e:
         return jsonify({'error': str(e)}), 500
-        
     finally:
-        if os.path.exists(file_path):
-            os.remove(file_path)
-
-if __name__ == '__main__':
-    app.run(debug=True, port=5001)
+        if os.path.exists(tmp_file.name):
+            os.remove(tmp_file.name)

@@ -79,7 +79,7 @@ function FileUpload() {
 
           {results.findings.length > 0 && (
             <div className="findings">
-              <h3>🚩 Detected Issues:</h3>
+              <h3> Detected Issues:</h3>
               <ul>
                 {results.findings.map((item, index) => (
                   <li key={index}>{item}</li>
